@@ -9,6 +9,9 @@ from typing import Tuple, Optional, List
 from einops import rearrange
 from .utils import hash_state_dict_keys
 
+ATTENTION_MODE = os.environ.get("FLASHVSR_ATTENTION_MODE", "sparse").lower()
+print(f"[WAN DIT] Initial attention mode: {ATTENTION_MODE}")
+
 try:
     import flash_attn_interface
     FLASH_ATTN_3_AVAILABLE = True
@@ -221,6 +224,25 @@ def generate_draft_block_mask_sage(batch_size, nheads, seqlen,
 # Attention kernels
 # ----------------------------
 def flash_attention(q: torch.Tensor, k: torch.Tensor, v: torch.Tensor, num_heads: int, compatibility_mode=False, attention_mask=None, return_KV=False):
+    # 检查是否使用 SDPA 模式
+    if ATTENTION_MODE == "sdpa":
+        # SDPA 模式 - 不使用 mask
+        batch_size, seq_len, _ = q.shape
+        head_dim = q.shape[-1] // num_heads
+        
+        # 重塑为 [batch_size, num_heads, seq_len, head_dim]
+        q = rearrange(q, "b s (n d) -> b n s d", n=num_heads)
+        k = rearrange(k, "b s (n d) -> b n s d", n=num_heads)
+        v = rearrange(v, "b s (n d) -> b n s d", n=num_heads)
+        
+        # 使用 PyTorch 的 SDPA，不使用 mask
+        x = F.scaled_dot_product_attention(q, k, v, attn_mask=None)
+        
+        # 重塑回原始格式
+        x = rearrange(x, "b n s d -> b s (n d)", n=num_heads)
+        return x
+    
+    # 以下是原有的代码逻辑，只在非 SDPA 模式下执行
     if attention_mask is not None:
         seqlen = q.shape[1]
         seqlen_kv = k.shape[1]
@@ -356,7 +378,14 @@ class AttentionModule(nn.Module):
         self.num_heads = num_heads
         
     def forward(self, q, k, v, attention_mask=None):
-        x = flash_attention(q=q, k=k, v=v, num_heads=self.num_heads, attention_mask=attention_mask)
+        # 在 SDPA 模式下强制不使用 mask
+        if ATTENTION_MODE == "sdpa":
+            attention_mask = None
+        x = flash_attention(
+            q=q, k=k, v=v, 
+            num_heads=self.num_heads, 
+            attention_mask=attention_mask
+        )
         return x
 
 
@@ -418,15 +447,22 @@ class SelfAttention(nn.Module):
 
         window_size = win[0]*h*w//128
 
-        if self.local_attn_mask is None or self.local_attn_mask_h!=h//8 or self.local_attn_mask_w!=w//8 or self.local_range!=local_range:
-            self.local_attn_mask = build_local_block_mask_shifted_vec_normal_slide(h//8, w//8, local_range, local_range, include_self=True, device=k_w.device)
-            self.local_attn_mask_h = h//8
-            self.local_attn_mask_w = w//8
-            self.local_range = local_range
-        if USE_BLOCK_ATTN and BLOCK_ATTN_AVAILABLE:
-            attention_mask = generate_draft_block_mask(B, self.num_heads, seqlen, q_w, k_w, topk=topk, local_attn_mask=self.local_attn_mask)
+        # 检查是否使用 SDPA 模式
+        from .wan_video_dit import ATTENTION_MODE
+        if ATTENTION_MODE == "sdpa":
+            # SDPA 模式：不使用 mask
+            attention_mask = None
         else:
-            attention_mask = generate_draft_block_mask_sage(B, self.num_heads, seqlen, q_w, k_w, topk=topk, local_attn_mask=self.local_attn_mask)
+            # 非 SDPA 模式：生成 mask
+            if self.local_attn_mask is None or self.local_attn_mask_h!=h//8 or self.local_attn_mask_w!=w//8 or self.local_range!=local_range:
+                self.local_attn_mask = build_local_block_mask_shifted_vec_normal_slide(h//8, w//8, local_range, local_range, include_self=True, device=k_w.device)
+                self.local_attn_mask_h = h//8
+                self.local_attn_mask_w = w//8
+                self.local_range = local_range
+            if USE_BLOCK_ATTN and BLOCK_ATTN_AVAILABLE:
+                attention_mask = generate_draft_block_mask(B, self.num_heads, seqlen, q_w, k_w, topk=topk, local_attn_mask=self.local_attn_mask)
+            else:
+                attention_mask = generate_draft_block_mask_sage(B, self.num_heads, seqlen, q_w, k_w, topk=topk, local_attn_mask=self.local_attn_mask)
 
         x = self.attn(reorder_q, reorder_k, reorder_v, attention_mask)
 
@@ -861,4 +897,14 @@ class WanModelStateDictConverter:
         else:
             config = {}
         return state_dict, config
-    
+
+# 添加一个函数来动态设置 attention mode
+def set_attention_mode(mode: str):
+    """Set the attention mode globally"""
+    global ATTENTION_MODE
+    mode = mode.lower()
+    if mode in ["sdpa", "sparse", "flash", "sage"]:
+        ATTENTION_MODE = mode
+        print(f"[WAN DIT] Attention mode set to: {ATTENTION_MODE}")
+    else:
+        print(f"[WAN DIT] Unknown attention mode: {mode}, using default")
